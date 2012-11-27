@@ -12,8 +12,9 @@ import (
 )
 
 type Store struct {
-	Name string
+	Name, Address, Phone, Website string
 	Lat, Long float64
+	Inventory []inventory.Item `datastore:"-" json:",omitempty`
 }
 
 func Pathway() *pathways.Edge {
@@ -88,6 +89,14 @@ func (sg *StoreGet) EdgeHandler(w http.ResponseWriter, r *pathways.PathRequest) 
 		http.Error(w, "No store with that id found", http.StatusNotFound)
 		return
 	}
+	c.Infof("About to get the products")
+	storeProducts, err := GetStoreProducts(c, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	c.Infof("Got 'em! %v", storeProducts)
+	store.Inventory = storeProducts
 	if out, err := json.Marshal(store); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	} else {
@@ -101,29 +110,12 @@ func (il *InventoryList) EdgeHandler(w http.ResponseWriter, r *pathways.PathRequ
 	c := appengine.NewContext(r.Request)
 	var id int64
 	fmt.Sscan( r.Request.Form.Get("id"), &id)
-	q := datastore.NewQuery("inventory").Filter("Store =", datastore.NewKey(c, "store", "",id, nil))
-	keys := make([]*datastore.Key,1000)
-	i := 0
-	for t := q.Run(c); ; {
-		var item inventory.Item
-		_, err := t.Next(&item)
-		if err == datastore.Done {
-			break
-		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		keys[i] = item.Product
-		i++
-	}
-	keys = keys[:i]
-	products := make([]products.Product,i)
-	if err := datastore.GetMulti(c, keys, products); err != nil {
+	storeProducts, err := GetStoreProducts(c, id);
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return		
 	}
-	if out, err := json.Marshal(products); err != nil {
+	if out, err := json.Marshal(storeProducts); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	} else {
@@ -167,20 +159,53 @@ func PutInventory(c appengine.Context, item *inventory.Item) error {
 		itemLock <- datastore.Get(c, datastore.NewKey(c, "product", "",item.ProductID, nil), &product)
 	}()
 	if err := <-itemLock; err != nil {
-		c.Infof("Error in Get: %v", err)
+		c.Infof("Error in Get for item %v : %v", item, err)
 		return err
 	}
 	if err := <-itemLock; err != nil {
-		c.Infof("Error in Get: %v", err)
+		c.Infof("Error in Get for item %v : %v", item, err)
 		return err
 	}
 
-	item.Store = datastore.NewKey(c, "store", "",item.StoreID, nil)
-	item.Product = datastore.NewKey(c, "product", "",item.ProductID, nil)
+	item.StoreKey = datastore.NewKey(c, "store", "",item.StoreID, nil)
+	item.ProductKey = datastore.NewKey(c, "product", "",item.ProductID, nil)
 	_, err := datastore.Put(c, datastore.NewIncompleteKey(c,"inventory", nil), item)
 	if err != nil {
 		c.Infof("Error in Put: %v", err)
 		return err
 	}
 	return nil
+}
+
+func GetStoreProducts(c appengine.Context, id int64) ([]inventory.Item, error) {
+	q := datastore.NewQuery("inventory").Filter("StoreKey =", datastore.NewKey(c, "store", "",id, nil))
+	c.Infof("Query made")
+	count := 0
+	items := make(chan inventory.Item)
+	itemSlice := make([]inventory.Item, 0)
+	for t := q.Run(c); ; {
+		var item inventory.Item
+		_, err := t.Next(&item)
+		if err == datastore.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		c.Infof("Item to fetch product: %v", item)
+		go func(c appengine.Context, item inventory.Item) {
+			var product products.Product
+			if err := datastore.Get(c, item.ProductKey, &product); err != nil {
+				items <- item
+			}
+			item.Product = product
+			items <- item
+		}(c, item)
+		count++
+	}
+	for i := 0; i < count; i++ {
+		itemSlice = append(itemSlice, <-items)
+	}
+
+	return itemSlice, nil
 }

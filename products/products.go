@@ -12,6 +12,8 @@ import (
 type Product struct {
 	Name string
 	Type string
+	Size string
+	BarCodeInfo string
 }
 
 func Pathway() *pathways.Edge {
